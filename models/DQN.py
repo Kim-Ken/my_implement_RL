@@ -8,19 +8,58 @@ import torchvision.transforms as T
 import numpy as np
 from PIL import Image
 import wandb
+import math
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 resize = T.Compose([T.ToPILImage(),
                     T.Resize(40, interpolation=Image.CUBIC),
                     T.ToTensor()])
 
+class NoisyLayer(nn.Module):
+    def __init__(self,input_feature,output_feature,sigma=0.5):
+        super(NoisyLayer,self).__init__()
+        self.input_feature = input_feature
+        self.output_feature = output_feature
+        self.sigma = 0.5
+
+        self.weight = nn.Parameter(torch.Tensor(output_feature,input_feature))
+        self.weight_noise = nn.Parameter(torch.Tensor(output_feature,input_feature))
+        self.var = nn.Parameter(torch.Tensor(output_feature))
+        self.var_noise = nn.Parameter(torch.Tensor(output_feature))
+        self.reset_parameter()
+
+    def reset_parameter(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv,stdv)
+        self.var.data.uniform_(-stdv,stdv)
+
+        initial_simga = stdv * self.sigma
+        self.weight_noise.data.fill_(initial_simga)
+        self.var_noise.data.fill_(initial_simga)
+        
+    def forward(self,input):
+        rand_in = self._f(torch.randn(1,self.input_feature,device=device))
+        rand_out = self._f(torch.randn(self.output_feature,1,device=device))
+        epsilon_w = torch.matmul(rand_out,rand_in)
+        epsilon_b = rand_out.squeeze()
+        
+        w = self.weight + self.weight_noise * epsilon_w
+        b = self.var + self.var_noise * epsilon_b
+
+        return F.linear(input,w,b)
+    
+    def _f(self,x):
+        return torch.sign(x) * torch.sqrt(torch.abs(x))
+
 class network(nn.Module):
-        def __init__(self,input_type,obs_size,batch_size,action_size):
+        def __init__(self,input_type,obs_size,batch_size,action_size,duel,noise):
             super(network,self).__init__()
             conv_put=100
             self.batch_size = batch_size
             self.action_size = action_size
             self.put = 16
+            self.duel = duel
+            self.noise = noise
             if input_type == 'image':
                 #print(obs_size)
                 def calc_out_put_size(size,kernel_size=5,stride=2):
@@ -41,21 +80,38 @@ class network(nn.Module):
                 self.model = nn.Sequential(nn.Linear(input_size,16,kernel_size=5,stride=2),
                 nn.Relu()
                 )
-            self.head = nn.Linear(self.put,self.action_size)
+            if noise == 'T':
+                if self.duel =='T':
+                    self.value_layer = NoisyLayer(self.put,1)
+                    self.action_layer = NoisyLayer(self.put,self.action_size)
+                else:
+                    self.head = NoisyLayer(self.put,self.action_size)
+
+            else:
+                if self.duel =='T':
+                    self.value_layer = nn.Linear(self.put,1)
+                    self.action_layer = nn.Linear(self.put,self.action_size)
+                else:
+                    self.head = nn.Linear(self.put,self.action_size)
 
         def forward(self,state):
             x = self.model(state)
             #print(x.shape)
-            return self.head(x.view(x.size(0),-1))
+            if self.duel == 'T':
+                a = self.action_layer(x.view(x.size(0),-1))
+                v = self.value_layer(x.view(x.size(0),-1))
+                return  v + a
+            else:
+                return self.head(x.view(x.size(0),-1))
 
 class DQN():
 
     def __init__(self,learn=True,input_type='image',obs_size=(100,200),batch_size=16,action_size=2,\
         eps_min=0.1,eps_dec=0.0001,eps_step=200,gamma=0.999,update_target=2000,optimizer='RMSProp',capacity=10000,\
-        duel='T',multi_step=1,noisy='T',prop='T',categorical='T',priorized='T'):
-        
-        self.q_network = network(input_type,obs_size,batch_size,action_size).to(device)
-        self.q_t_network  = network(input_type,obs_size,batch_size,action_size).to(device)
+        duel='T',multi_step=1,noise='T',prop='T',categorical='T',priorized='T'):
+
+        self.q_network = network(input_type,obs_size,batch_size,action_size,duel,noise).to(device)
+        self.q_t_network  = network(input_type,obs_size,batch_size,action_size,duel,noise).to(device)
         self.step_num = 1
         self.eps=1.0
 
@@ -78,13 +134,16 @@ class DQN():
             pass
     
     def policy(self,state,mode='learn'):
-        if self.step_num % self.eps_step == 0 and self.eps_min<self.eps:
-            self.eps=self.eps-self.eps_dec
-        r = random.random()
+        
 
         if self.step_num % self.update_target == 0:
             print(self.eps)
             self.q_t_network.load_state_dict(self.q_network.state_dict())
+
+        if self.step_num % self.eps_step == 0 and self.eps_min<self.eps:
+            self.eps=self.eps-self.eps_dec
+        r = random.random()
+
         self.step_num += 1
 
         if r > self.eps and mode=='learn':
